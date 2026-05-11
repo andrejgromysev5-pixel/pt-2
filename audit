@@ -1,0 +1,167 @@
+Практическая работа №4
+Аудит событий: journalctl и auditd
+
+Ошибки в системе с последней загрузки
+Команда: `journalctl -p err -b`
+Пользователь az не входит в группу `adm`, поэтому команда выдала предупреждение:
+```
+Hint: You are currently not seeing messages from other users and the system.
+Users in groups 'adm', 'systemd-journal' can see all messages.
+Pass -q to turn off this notice.
+```
+Из журнала за текущий сеанс (`journalctl --since "30 minutes ago"`) видны предупреждения графической подсистемы:
+`kwin_wayland_wrapper`: libEGL warning — failed to create dri2 screen (VMware без 3D-ускорения)
+`kwin_wayland[870]`: pw.conf: can't load config client.conf (отсутствует PipeWire конфиг)
+`plasmashell`: Failed to create PipeWire context
+Все ошибки некритические и связаны с работой в виртуальной машине VMware без 3D-ускорения.
+---
+Статистика входов
+Команды:
+```bash
+journalctl _COMM=sshd | grep "Accepted"
+journalctl _COMM=sshd | grep "Failed"
+```
+```
+-- No entries --
+-- No entries --
+```
+Успешных входов по SSH: 0
+Неудачных попыток по SSH: 0
+SSH-сервис на машине не использовался (нет записей sshd). Вход выполнялся только через локальный терминал pts/1. Это подтверждается командой `journalctl -u sshd -n 30` — также пустой вывод.
+---
+2. auditd — настройка правил
+Установка и статус
+```
+● auditd.service - Security Auditing Service
+   Loaded: loaded (/lib/systemd/system/auditd.service; enabled; preset: enabled)
+   Active: active (running) since Thu 2026-05-07 00:12:44 +05; 25min ago
+  Main PID: 471 (auditd)
+    Tasks: 2 (limit: 2252)
+   Memory: 2.2M
+```
+Версия: `1:3.0.9-1`. Статус `active (running)`, добавлен в автозапуск (`enabled`).
+---
+Первоначальный вид журнала auditd (до правил)
+Команда: `sudo auditctl -l`
+```
+No rules
+```
+Команда: `sudo tail -20 /var/log/audit/audit.log` — зафиксированы типы записей:
+Тип	Что означает
+`CRED_REFR`	Обновление учётных данных (PAM)
+`USER_START`	Открытие пользовательской сессии
+`USER_END`	Закрытие пользовательской сессии
+`USER_CMD`	Выполнение команды через sudo
+`USER_ACCT`	Запрос учётной записи (аутентификация)
+`USER_DISP`	Отображение имени пользователя
+`type=SYSCALL` — запись о системном вызове ядра: содержит PID процесса, UID, EUID, имя исполняемого файла и результат вызова.
+---
+Сводка aureport
+Команда: `sudo aureport`
+```
+Summary Report
+======================
+Range of time in logs: 06.05.2026 22:54:43 - 07.05.2026 01:12:49
+Number of changes in configuration: 6
+Number of logins: 0
+Number of failed logins: 0
+Number of authentications: 6
+Number of failed authentications: 1
+Number of users: 4
+Number of terminals: 10
+Number of executables: 7
+Number of commands: 6
+Number of files: 0
+Number of events: 336
+```
+Разбор колонок: Range — временной охват журнала; authentications — все попытки аутентификации (sudo, su, login); failed — неуспешные; users — число уникальных пользователей; events — общее число записей в журнале.
+---
+Применённые правила (вывод `auditctl -l`)
+После создания файла `/etc/audit/rules.d/security-course.rules` и команды `sudo augenrules --load`:
+```
+-w /etc/passwd -p rwa -k auth-files
+-w /etc/shadow -p rwa -k auth-files
+-w /etc/group -p rwa -k auth-files
+-w /etc/sudoers -p rwa -k priv-files
+-w /etc/sudoers.d -p rwa -k priv-files
+-a always,exit -F arch=b64 -S open,openat -F success=0 -F key=access-denied
+-a always,exit -F arch=b64 -S unlink,unlinkat -F key=file-delete
+-a always,exit -F arch=b64 -S execve -F euid=0 -F auid!=0 -F auid!=-1 -F key=priv-exec
+```
+Итого: 8 активных правил.
+---
+Разбор записи SYSCALL
+Пример из `sudo ausearch -k auth-files -i | tail -30` (07.05.2026 21:29:21):
+```
+type=SYSCALL msg=audit(07.05.2026 21:29:21.205:3309) : arch=x86_64
+  syscall=openat success=yes exit=7 a0=AT_FDCWD a1=0x7f197ed9cbd6
+  a2=O_RDONLY|O_CLOEXEC a3=0x0 items=1 ppid=1226 pid=1700
+  auid=az uid=az gid=az euid=root suid=root fsuid=root
+  egid=az sgid=az fsgid=az tty=pts2 ses=4
+  comm=sudo exe=/usr/bin/sudo subj=unconfined key=auth-files
+```
+Поле	Значение	Что означает
+`auid`	az (1000)	Audit UID — исходный UID вошедшего пользователя. Не меняется при sudo/su. Главный идентификатор при расследовании
+`uid`	az	Реальный UID процесса (пользователь az вызвал sudo)
+`euid`	root	Effective UID — с правами root выполнялся системный вызов
+`comm`	sudo	Краткое имя программы как видит её ядро
+`exe`	/usr/bin/sudo	Полный путь к исполняемому файлу
+`auid=az` и `euid=root` вместе означают: пользователь az повысил привилегии через sudo для доступа к файлу.
+3. Расследование инцидента
+Хронология действий bob
+```bash
+su bob
+```
+Время	Действие	Результат	Источник (команда поиска)
+21:31:47	`cat /etc/shadow`	Отказано в доступе	`ausearch -k access-denied`
+21:31:47	`ls /root`	Отказано в доступе ("невозможно открыть каталог '/root'")	`ausearch -k access-denied`
+21:31:47	`cat /etc/passwd`	Успех — содержимое прочитано	`ausearch -k auth-files`
+21:31:47	`touch /tmp/totally-not-malware.sh`	Успех — файл создан	`ausearch --start recent | grep totally-not-malware`
+21:31:47	`echo '#!/bin/bash' > /tmp/totally-not-malware.sh`	Успех — запись в файл	`ausearch --start recent | grep totally-not-malware`
+21:31:47	`cat /etc/sudoers`	Отказано в доступе	`ausearch -k access-denied`
+В журнале `aureport -k --failed` зафиксированы тысячи записей `access-denied` для `/usr/bin/sudo`, `/usr/bin/grep`, `/usr/sbin/ausearch` — это нормально, auditd фиксирует каждую попытку системного вызова, включая служебные операции расследования.
+Файл `totally-not-malware` обнаружен поиском:
+```
+sudo ausearch --start recent -i | grep "totally-not-malware"
+type=PROCTITLE msg=audit(07.05.2026 21:31:47.236:4619) : proctitle=grep totally-not-malware
+type=PROCTITLE msg=audit(07.05.2026 21:33:36.726:5258) : proctitle=grep totally-not-malware
+```
+---
+Как auditd помог расследованию
+Фиксация отказов — правило `access-denied` перехватило все попытки НСД к `/etc/shadow`, `/root`, `/etc/sudoers`, которые не оставляют следов в прикладных журналах.
+Полная хронология — все события bob зафиксированы с точностью до миллисекунды (21:31:47.236).
+Обнаружение подозрительного файла — поиск по имени файла через `ausearch` мгновенно нашёл создание `totally-not-malware.sh`.
+Неизменяемость auid — даже после `su bob` поле `auid` сохраняло исходный UID, что позволяло однозначно установить личность.
+---
+Контрольные вопросы 
+1. Чем принципиально отличается auditd от journald? Почему нельзя обойтись только journald?
+journald работает в пространстве пользователя — он собирает только то, что приложения сами решили записать в журнал. Если приложение не записывает события или злоумышленник подменил его, следов не останется.
+auditd работает на уровне ядра Linux через подсистему audit. Он перехватывает системные вызовы (openat, execve, unlink и т. д.) до того, как они будут выполнены, — приложение физически не может скрыть свои действия. Кроме того, только auditd сохраняет поле auid и умеет отслеживать конкретные файлы и системные вызовы с помощью гибких фильтров. Без journald не обойтись: он не зафиксирует отказ в доступе к файлу, не покажет cat /etc/shadow от имени пользователя bob без sudo, не сохранит исходный UID при смене пользователя.
+
+2. Что такое auid и почему оно важнее uid при расследовании инцидентов, связанных с sudo?
+auid (Audit UID) — это UID пользователя, который первоначально вошёл в систему. Он устанавливается один раз при создании сеанса (вход в систему через ssh) и не меняется ни при sudo, ни при su, ни при runuser.
+uid — текущий UID процесса, который меняется при повышении привилегий. После sudo cat /etc/shadow в записи будет uid=root, но auid=az — это и есть настоящий виновник. Без auid при расследовании можно было бы увидеть только запись «root читал shadow», но не понять, кто именно это делал.
+
+3. Что означает флаг -k в правиле auditd? Для чего он используется?
+-k задает ключ (key) — произвольную текстовую метку, которая прикрепляется ко всем событиям, генерируемым этим правилом. Например: -k auth-files, -k access-denied.
+Используется для быстрой фильтрации: вместо просмотра тысяч строк в журнале достаточно выполнить ausearch -k auth-files и получить только события, связанные с файлами аутентификации.  Без ключей пришлось бы фильтровать вручную по именам файлов или PID.
+
+4. Чем -w (watch) отличается от -a always,exit в правилах auditd? Когда использовать каждый из них?
+-w /путь/к/файлу -p rwa — файловый вотчер: отслеживает конкретный файл или директорию, перехватывает операции чтения/записи/изменения атрибутов. Синтаксис проще, применяется, когда нужно отслеживать доступ к конкретному объекту (например, /etc/passwd, /etc/sudoers).
+-a always,exit -F arch=b64 -S execve -F euid=0 — правило для системного вызова: перехватывает указанные системные вызовы с заданными условиями по всей системе. Применяется, когда нужно отслеживать класс действий независимо от файла — например, все запуски процессов с euid=0, все неудачные попытки открытия файлов, все удаления. Более гибкий вариант -w, но требует знания названий системных вызовов.
+Коротко: -w для файлов, -a always,exit для поведения.
+
+5. Злоумышленник удалил /var/log/audit/audit.log. Как это помогает скрыть следы и как защититься?
+Помогает скрыть следы: все события, произошедшие до момента удаления, уничтожены. Правило file-delete (-a always,exit -S unlink) само по себе не поможет — событие удаления будет записано туда же и тоже исчезнет.  aureport и ausearch перестанут находить улики.
+Как защититься:
+
+Удаленная отправка логов (audisp-remote) — события в режиме реального времени пересылаются на отдельный SIEM-сервер, к которому у злоумышленника нет доступа. 
+Неизменяемый режим (auditctl -e 2) — переводит правила в неизменяемый режим, после чего изменить или остановить auditd можно только перезагрузкой. 
+Права на файл — /var/log/audit/ принадлежат пользователю root и недоступны обычным пользователям, но от компрометации root-доступа это не защищает. 
+Мониторинг самого файла — правило -w /var/log/audit/ -p wa -k audit-log-tamper зафиксирует попытку до ее совершения (если лог отправляется удаленно).
+
+
+6. Что нужно сделать, чтобы правила auditd сохранились после перезагрузки?
+Создать файл правил в директории /etc/audit/rules.d/ с расширением .rules (например, security-course.rules) и применить его с помощью команды:
+sudo augenrules --load
+augenrules при каждом запуске системы считывает все .rules-файлы из этой директории, объединяет их в /etc/audit/audit.rules и загружает.  Временные правила через auditctl -w ... не сохраняются — они действуют только до перезагрузки.
